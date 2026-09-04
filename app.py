@@ -12,18 +12,55 @@ CHAT_MODEL = "llama3.2"
 
 
 def split_text(text: str, chunk_size: int = 800, overlap: int = 150) -> list[str]:
-    """Split text into overlapping character-based chunks."""
+    """Split text into sentence-based chunks with optional character overlap."""
+    if chunk_size<=0:
+        raise ValueError("chunk_size must be greater than 0.")
+    if not 0<=overlap<chunk_size:
+        raise ValueError("overlap must be at least 0 and smaller than chunk_size.")
+    sentences = re.split(r"(?<=[.!?])\s+", text.strip())
     chunks = []
-    start = 0
-
-    while start < len(text):
-        end = min(start + chunk_size, len(text))
-        chunks.append(text[start:end])
-
-        if end == len(text):
-            break
-
-        start = end - overlap
+    current_chunk=""
+    for sentence in sentences:
+        sentence=sentence.strip()
+        if not sentence:
+            continue
+        if len(sentence)>chunk_size:
+            if current_chunk:
+                chunks.append(current_chunk)
+                current_chunk=""
+            for word in sentence.split():
+                if len(word)>chunk_size:
+                    if current_chunk:
+                        chunks.append(current_chunk)
+                        current_chunk=""
+                    chunks.extend(
+                        word[start:start+chunk_size]
+                        for start in range(0,len(word),chunk_size)
+                    )
+                    continue
+                candidate=f"{current_chunk} {word}".strip()
+                if len(candidate)<=chunk_size:
+                    current_chunk=candidate
+                else:
+                    chunks.append(current_chunk)
+                    overlap_text=current_chunk[-overlap:] if overlap else ""
+                    candidate=f"{overlap_text} {word}".strip()
+                    current_chunk=candidate if len(candidate)<=chunk_size else word
+            continue
+        if not current_chunk:
+            current_chunk=sentence
+            continue
+        candidate=f"{current_chunk} {sentence}".strip()
+        if len(candidate)<=chunk_size:
+            current_chunk=candidate
+            continue
+        else:
+            chunks.append(current_chunk)
+            overlap_text=current_chunk[-overlap:] if overlap else ""
+            candidate=f"{overlap_text} {sentence}".strip()
+            current_chunk=candidate if len(candidate)<=chunk_size else sentence
+    if current_chunk:
+        chunks.append(current_chunk)         
 
     return chunks
 
@@ -71,12 +108,15 @@ def find_relevant_chunks(
     return sorted(scored_chunks, key=lambda item: (0.85 * item[1]) + (0.15 * item[2]), reverse=True)[:top_k]
 
 
-def generate_answer(question: str, relevant_chunks: list[tuple[str, float]]) -> str:
+def generate_answer(question: str, relevant_chunks: list[tuple[str, float,float]]) -> str:
     """Generate an answer using only the retrieved document passages."""
     context = "\n\n".join(
         f"Passage {number}:\n{chunk}"
         for number, (chunk, _, _) in enumerate(relevant_chunks, start=1)
     )
+    st.write("DEBUG QUESTION:", question)
+    st.write("DEBUG CONTEXT:")
+    st.code(context)
     response = requests.post(
         CHAT_URL,
         json={
@@ -85,12 +125,14 @@ def generate_answer(question: str, relevant_chunks: list[tuple[str, float]]) -> 
                 {
                     "role": "system",
                     "content": (
-                        "You are a precise document question-answering assistant. "
-                        "Read every supplied passage before answering. "
-                        "Answer only from facts explicitly written in those passages. "
-                        "When a passage explicitly states the requested fact, give that fact directly. "
-                        "Only say 'I cannot find that in the document.' when no supplied passage "
-                        "contains the requested fact. Do not use outside knowledge."
+                        "You are a document question-answering assistant. "
+                        "Answer questions using only the information in the supplied passages. "
+                        "when the question uses words such as 'my', 'I', or 'me'. "
+                        "Treat the person described in the document as the person the user is referring to "
+                        "If the requested information appears in the passages, return it directly. "
+                        "Do not use outside knowledge. "
+                        "Only say 'I cannot find that in the document.' when the requested information "
+                        "is genuinely not present in the supplied passages."
                     ),
                 },
                 {
