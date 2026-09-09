@@ -11,7 +11,7 @@ OLLAMA_URL = "http://localhost:11434/api/embed"
 EMBEDDING_MODEL = "embeddinggemma"
 CHAT_URL = "http://localhost:11434/api/chat"
 CHAT_MODEL = "llama3.2"
-INDEX_VERSION = "sentence-chunks-hybrid-rerank-v1"
+INDEX_VERSION = "sentence-chunks-hybrid-rerank-query-planner-evidence-v1"
 
 
 def split_text(text: str, chunk_size: int = 800, overlap: int = 150) -> list[str]:
@@ -84,6 +84,10 @@ def cosine_similarity(first: list[float], second: list[float]) -> float:
     dot_product = sum(a * b for a, b in zip(first, second))
     first_length = math.sqrt(sum(value * value for value in first))
     second_length = math.sqrt(sum(value * value for value in second))
+
+    if first_length==0 or second_length==0:
+        return 0.0
+    
     return dot_product / (first_length * second_length)
 
 def keyword_overlap(question: str, chunk: str)->float:
@@ -148,7 +152,7 @@ def rerank_chunks(
             timeout=120,
         )
         response.raise_for_status()
-        ranked_index=json.loads(response.json()["messages"]["content"])["ranked_indexes"]
+        ranked_index=json.loads(response.json()["message"]["content"])["ranked_indexes"]
         valid_indexes=[]
         for index in ranked_index:
             if isinstance(index,int) and 0<=index<len(candidate_chunks):
@@ -157,13 +161,61 @@ def rerank_chunks(
         ranked_chunks=[candidate_chunks[index] for index in valid_indexes]  
     except (requests.RequestException, json.JSONDecodeError, KeyError, TypeError):
         ranked_chunks = []    
-        for chunk in candidate_chunks:
-            if chunk not in ranked_chunks:
-                ranked_chunks.append(chunk)  
-        return ranked_chunks[:top_k]            
+    for chunk in candidate_chunks:
+        if chunk not in ranked_chunks:
+            ranked_chunks.append(chunk)  
+    return ranked_chunks[:top_k]      
 
-def generate_answer(question: str, relevant_chunks: list[tuple[str, float,float]]) -> str:
-    """Generate an answer using only the retrieved document passages."""
+
+def rewrite_question(question:str,chunks:list[str])->str:
+     """Ask the LLM to turn a vague question into a document-search query."""
+     document_excerpt="\n\n".join(chunks[:12])
+     try:
+         response=requests.post(
+             CHAT_URL,
+             json={
+                "model": CHAT_MODEL,
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are a search-query planner, not a question-answering assistant. "
+                            "Return an ABSTRACT search intent, never an answer or a fact extracted "
+                            "from the document. Do not return names, numbers, dates, job titles, or "
+                            "other specific document values. Use generic concepts only. "
+                            "Examples: for 'What is my name?' return 'person full name identity'; "
+                            "for 'What are my skills?' return 'professional technical skills'; "
+                            "for 'What are they talking about?' return 'document main subject overview'. "
+                            "Return only valid JSON: {\"search_query\": \"...\"}."
+                        ),
+                    },
+                    {
+                        "role": "user",
+                        "content": (
+                            f"Document:\n{document_excerpt}\n\n"
+                            f"User question: {question}"
+                        ),
+                    },
+                ],
+                "format": "json",
+                "stream": False,
+                "options": {"temperature": 0},
+            },
+         timeout=120,
+         )      
+         response.raise_for_status()
+         search_query=json.loads(
+             response.json()["message"]["content"]
+         )["search_query"]
+         if not isinstance(search_query,str):
+             return question
+         search_query=search_query.strip()
+         return search_query or question
+     except(requests.RequestException, json.JSONDecodeError, KeyError, TypeError):
+         return question
+
+def generate_answer(question: str, relevant_chunks: list[tuple[str, float,float]]) -> tuple[str, list[int]]:
+    """Extract a grounded answer and the source numbers that support it."""
     context = "\n\n".join(
         f"Passage {number}:\n{chunk}"
         for number, (chunk, _, _) in enumerate(relevant_chunks, start=1)
@@ -176,12 +228,13 @@ def generate_answer(question: str, relevant_chunks: list[tuple[str, float,float]
                 {
                     "role": "system",
                     "content": (
-                        "You are a precise document question-answering assistant. "
-                        "Read every supplied passage before answering. "
-                        "Answer only from facts explicitly written in those passages. "
-                        "When a passage explicitly states the requested fact, give that fact directly. "
-                        "Only say 'I cannot find that in the document.' when no supplied passage "
-                        "contains the requested fact. Do not use outside knowledge."
+                        "You answer questions using only numbered document passages. "
+                        "First inspect every passage for evidence, then answer directly from that evidence. "
+                        "If a passage contains the requested fact, you must use it; do not claim it is missing. "
+                        "Only use the missing-answer message when no passage supports any answer. "
+                        "Return only JSON in this exact structure: "
+                        '{"answer": "...", "source_numbers": [1, 2]}. '
+                        "source_numbers must contain the passage numbers supporting the answer."
                     ),
                 },
                 {
@@ -189,13 +242,32 @@ def generate_answer(question: str, relevant_chunks: list[tuple[str, float,float]
                     "content": f"Document passages:\n{context}\n\nQuestion: {question}",
                 },
             ],
+            "format": "json",
             "stream": False,
             "options": {"temperature": 0},
         },
         timeout=120,
     )
     response.raise_for_status()
-    return response.json()["message"]["content"]
+    try:
+        result = json.loads(response.json()["message"]["content"])
+        answer = result["answer"].strip()
+        source_numbers = result.get("source_numbers", [])
+        if not isinstance(answer, str) or not isinstance(source_numbers, list):
+            raise TypeError
+
+        valid_sources = sorted(
+            {
+                number
+                for number in source_numbers
+                if isinstance(number, int) and 1 <= number <= len(relevant_chunks)
+            }
+        )
+        return answer, valid_sources
+    except (json.JSONDecodeError, KeyError, TypeError, AttributeError):
+        return "I could not produce a grounded answer from the retrieved passages.", []
+
+
 
 
 st.set_page_config(page_title="My RAG Learning App", page_icon="📚")
@@ -210,13 +282,19 @@ uploaded_file = st.file_uploader(
 
 if uploaded_file:
     document_text = uploaded_file.getvalue().decode("utf-8",errors="replace")
+    if not document_text.strip():
+        st.error("The uploaded file is empty. Upload a text file with content.")
+        st.stop()
     chunks = split_text(document_text)
     document_id = hashlib.sha256(f"{INDEX_VERSION}:{document_text}".encode("utf-8")).hexdigest()
+
+
     if st.session_state.get("document_id")!=document_id:
         st.session_state.document_id=document_id
         st.session_state.pop("embeddings",None)
         st.session_state.pop("relevant_chunks",None)
         st.session_state.pop("retrieval_question",None)
+        st.session_state.pop("search_query", None)
 
     st.success(f"Loaded: {uploaded_file.name}")
     st.caption(f"Document length: {len(document_text):,} characters")
@@ -246,21 +324,24 @@ if uploaded_file:
     
     if "embeddings" not in st.session_state:
         st.info("First, click 'Create local embeddings' for this document.")
-    elif st.button("Find relevant chunks", disabled=not question):
+    elif st.button("Find relevant chunks", disabled=not question.strip()):
         try:
-            with st.spinner("Searching document chunks..."):
+            with st.spinner("Understanding the question and searching document chunks..."):
+                search_query=rewrite_question(question.strip(),chunks)
                 candidate_chunks = find_relevant_chunks(
-                    question,
+                    search_query,
                     chunks,
                     st.session_state.embeddings,
                 )
                 st.session_state.relevant_chunks=rerank_chunks(question.strip(),candidate_chunks)
-                st.session_state.retrieval_question = question
+                st.session_state.retrieval_question = question.strip()
+                st.session_state.search_query=search_query
         except requests.RequestException as error:
             st.error(f"Ollama could not search the document: {error}")
 
     if st.session_state.get("retrieval_question") == question.strip():
         relevant_chunks = st.session_state.relevant_chunks
+        st.caption(f"LLM search interpretation: {st.session_state.search_query}")
         st.write("These passages were retrieved from your document:")
         for number, (chunk, semantic_score, keyword_score) in enumerate(relevant_chunks, start=1):
             st.markdown(
@@ -271,10 +352,13 @@ if uploaded_file:
         if st.button("Generate grounded answer"):
             try:
                 with st.spinner("Generating an answer from retrieved passages..."):
-                    answer = generate_answer(question, relevant_chunks)
+                    answer, answer_sources = generate_answer(question.strip(), relevant_chunks)
 
                 st.subheader("Answer")
                 st.write(answer)
+                if answer_sources:
+                    citations = ", ".join(f"Source {number}" for number in answer_sources)
+                    st.caption(f"Answer evidence: {citations}")
             except requests.RequestException as error:
                 st.error(f"Ollama could not generate an answer: {error}")
 else:
