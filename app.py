@@ -2,9 +2,14 @@ import math
 import re
 import hashlib
 import json
+from pathlib import Path
+from io import BytesIO
+
 
 import requests
 import streamlit as st
+from pypdf import PdfReader
+from pypdf.errors import PdfReadError
 
 
 OLLAMA_URL = "http://localhost:11434/api/embed"
@@ -12,6 +17,17 @@ EMBEDDING_MODEL = "embeddinggemma"
 CHAT_URL = "http://localhost:11434/api/chat"
 CHAT_MODEL = "llama3.2"
 INDEX_VERSION = "sentence-chunks-hybrid-rerank-query-planner-evidence-v1"
+INDEX_DIRECTORY = Path(".rag_indexes")
+
+def extract_document_text(uploaded_file)->tuple[str] | None:
+    """Return readable text from a .txt file or text-based PDF upload."""
+    if uploaded_file.name.lower().endswith(".pdf"):
+        pdf_reader=PdfReader(BytesIO(uploaded_file.getvalue()))
+        document_text="\n".join(
+            page.extract_text() or "" for page in pdf_reader.pages
+        )
+        return document_text,len(pdf_reader.pages)
+    return uploaded_file.getvalue().decode("utf-8",errors="replace"),None
 
 
 def split_text(text: str, chunk_size: int = 800, overlap: int = 150) -> list[str]:
@@ -78,6 +94,31 @@ def create_embeddings(chunks: list[str]) -> list[list[float]]:
     response.raise_for_status()
     return response.json()["embeddings"]
 
+
+def load_saved_embeddings(document_id: str,chunks_count: int)->list[list[float]] | None:
+    """Load valid local embeddings for this exact document, if available."""
+    index_file=INDEX_DIRECTORY/f"{document_id}.json"
+    try:
+        saved_index=json.loads(index_file.read_text(encoding="utf-8"))
+        embeddings=saved_index["embeddings"]
+        if saved_index["index_version"]!=INDEX_VERSION:
+            return None
+        if not isinstance(embeddings,list) or len(embeddings)!=chunks_count:
+            return None
+        return embeddings
+    except (OSError, json.JSONDecodeError, KeyError, TypeError):
+        return None
+
+def save_embeddings(document_id: int,embeddings: list[list[float]])->None:
+    """Persist embeddings locally so this exact document does not need re-indexing."""
+    INDEX_DIRECTORY.mkdir(exist_ok=True)
+    index_file=INDEX_DIRECTORY/f"{document_id}.json"
+    index_file.write_text(
+        json.dumps({
+            "index_version":INDEX_VERSION,
+            "embeddings":embeddings
+        }),encoding="utf-8"
+    )    
 
 def cosine_similarity(first: list[float], second: list[float]) -> float:
     """Measure how similar two embedding vectors are, from -1 to 1."""
@@ -276,14 +317,19 @@ st.title("📚 My RAG Learning App")
 st.write("We will build this application step by step.")
 
 uploaded_file = st.file_uploader(
-    "Upload a text document",
-    type=["txt"],
+    "Upload a text document or PDF",
+    type=["txt","pdf"],
 )
 
 if uploaded_file:
-    document_text = uploaded_file.getvalue().decode("utf-8",errors="replace")
+    try:
+        document_text,pdf_page_count=extract_document_text(uploaded_file)
+    except(PdfReadError,ValueError) as error:
+        st.error(f"This PDF could not be read: {error}")
+        st.stop()
+
     if not document_text.strip():
-        st.error("The uploaded file is empty. Upload a text file with content.")
+        st.error("No readable text was found. For a scanned PDF, we need to add OCR first.")
         st.stop()
     chunks = split_text(document_text)
     document_id = hashlib.sha256(f"{INDEX_VERSION}:{document_text}".encode("utf-8")).hexdigest()
@@ -296,10 +342,23 @@ if uploaded_file:
         st.session_state.pop("retrieval_question",None)
         st.session_state.pop("search_query", None)
 
+        saved_embeddings=load_saved_embeddings(document_id,len(chunks))
+        if saved_embeddings:
+            st.session_state.embeddings=saved_embeddings
+            st.session_state.loaded_saved_index=True
+        else:
+            st.session_state.pop("loaded_saved_index",None)    
+
+
     st.success(f"Loaded: {uploaded_file.name}")
     st.caption(f"Document length: {len(document_text):,} characters")
+    if pdf_page_count is not None:
+        st.caption(f"PDF pages: {pdf_page_count}")
+
     st.caption(f"Created {len(chunks)} searchable chunks")
     st.caption("Embeddings run locally with Ollama — no API key required.")
+    if st.session_state.get("loaded_saved_index"):
+        st.info("Loaded saved local embeddings for this document.")
     with st.expander("Preview document text"):
         st.text(document_text)
 
@@ -312,11 +371,13 @@ if uploaded_file:
         try:
             with st.spinner("Creating vectors locally with Ollama..."):
                 embeddings = create_embeddings(chunks)
+                save_embeddings(document_id,embeddings)
+                st.session_state.loaded_saved_index = False
 
             st.session_state.embeddings = embeddings
             st.success(f"Created {len(embeddings)} local embeddings.")
             st.caption(f"Each embedding has {len(embeddings[0]):,} numeric dimensions.")
-        except requests.RequestException as error:
+        except(requests.RequestException,OSError) as error:
             st.error(f"Ollama could not create embeddings: {error}")
 
     st.subheader("Retrieve relevant chunks")
@@ -345,7 +406,7 @@ if uploaded_file:
         st.write("These passages were retrieved from your document:")
         for number, (chunk, semantic_score, keyword_score) in enumerate(relevant_chunks, start=1):
             st.markdown(
-                f"**Result {number}** — semantic: {semantic_score:.3f}, "
+                f"**Source {number}** — semantic: {semantic_score:.3f}, "
                 f"keyword match: {keyword_score:.0%}"
                     )
             st.code(chunk, language=None)
@@ -362,4 +423,4 @@ if uploaded_file:
             except requests.RequestException as error:
                 st.error(f"Ollama could not generate an answer: {error}")
 else:
-    st.info("Upload a .txt file to begin.")
+    st.info("Upload a .txt file or a text-based PDF to begin.")
