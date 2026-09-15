@@ -16,18 +16,32 @@ OLLAMA_URL = "http://localhost:11434/api/embed"
 EMBEDDING_MODEL = "embeddinggemma"
 CHAT_URL = "http://localhost:11434/api/chat"
 CHAT_MODEL = "llama3.2"
-INDEX_VERSION = "sentence-chunks-hybrid-rerank-query-planner-evidence-v1"
+INDEX_VERSION = "sentence-chunks-hybrid-rerank-query-planner-evidence-pages-v1"
 INDEX_DIRECTORY = Path(".rag_indexes")
 
-def extract_document_text(uploaded_file)->tuple[str] | None:
-    """Return readable text from a .txt file or text-based PDF upload."""
+def extract_document_pages(uploaded_file)->tuple[list[tuple[str,int | None]],int | None]:
+    """Return extracted text paired with its PDF page number, when available."""
     if uploaded_file.name.lower().endswith(".pdf"):
         pdf_reader=PdfReader(BytesIO(uploaded_file.getvalue()))
-        document_text="\n".join(
-            page.extract_text() or "" for page in pdf_reader.pages
-        )
-        return document_text,len(pdf_reader.pages)
-    return uploaded_file.getvalue().decode("utf-8",errors="replace"),None
+        pages=[
+            (page.extract_text() or "",number)
+            for number, page in enumerate(pdf_reader.pages,start=1)
+        ]
+        return pages,len(pages)
+    document_text=uploaded_file.getvalue().decode("utf-8",errors="replace")
+    return [(document_text,None)],None
+
+def create_chunks_with_sources(
+        document_pages:list[tuple[str,int | None]],
+)->tuple[list[str],list[int | None]]:
+    """Chunk each page separately so every chunk keeps one accurate source page."""
+    chunks=[]
+    chunk_pages=[]
+    for page_text,page_number in document_pages:
+        page_chunks=split_text(page_text)
+        chunks.extend(page_chunks)
+        chunk_pages.extend([page_number]*len(page_chunks))
+    return chunks,chunk_pages    
 
 
 def split_text(text: str, chunk_size: int = 800, overlap: int = 150) -> list[str]:
@@ -109,7 +123,7 @@ def load_saved_embeddings(document_id: str,chunks_count: int)->list[list[float]]
     except (OSError, json.JSONDecodeError, KeyError, TypeError):
         return None
 
-def save_embeddings(document_id: int,embeddings: list[list[float]])->None:
+def save_embeddings(document_id: str,embeddings: list[list[float]])->None:
     """Persist embeddings locally so this exact document does not need re-indexing."""
     INDEX_DIRECTORY.mkdir(exist_ok=True)
     index_file=INDEX_DIRECTORY/f"{document_id}.json"
@@ -144,26 +158,28 @@ def keyword_overlap(question: str, chunk: str)->float:
 def find_relevant_chunks(
     question: str,
     chunks: list[str],
+    chunk_pages:list[int | None],
     document_embeddings: list[list[float]],
     top_k: int = 5,
-) -> list[tuple[str, float,float]]:
-    """Embed a question, score every chunk, and return the best matches."""
+) -> list[tuple[str, int | None, float, float]]:
+    """Rank chunks with mostly semantic similarity plus a small keyword boost."""
     question_embedding = create_embeddings([question])[0]
 
-    scored_chunks = [(chunk, cosine_similarity(question_embedding, embedding),keyword_overlap(question, chunk),)
-        for chunk, embedding in zip(chunks, document_embeddings)
+    scored_chunks = [(chunk, page_number,cosine_similarity(question_embedding, embedding),keyword_overlap(question, chunk),)
+        for chunk, page_number,embedding in zip(chunks, chunk_pages,document_embeddings)
     ]
-    return sorted(scored_chunks, key=lambda item: (0.85 * item[1]) + (0.15 * item[2]), reverse=True)[:top_k]
+    return sorted(scored_chunks, key=lambda item: (0.85 * item[2]) + (0.15 * item[3]), reverse=True)[:top_k]
+
 
 def rerank_chunks(
         question:str,
-        candidate_chunks:list[tuple[str,float,float]],
+        candidate_chunks:list[tuple[str,int | None,float,float]],
         top_k:int=3,
-) -> list[tuple[str,float,float]]:
+) -> list[tuple[str,int | None,float,float]]:
     """Use the local chat model to order candidates by direct relevance."""
     passages = "\n\n".join(
-        f"Index {index}:\n{chunk}"
-        for index, (chunk, _, _) in enumerate(candidate_chunks)
+        f"Index {index}{f' (PDF page {page_number})' if page_number else ''}:\n{chunk}"
+        for index, (chunk,page_number, _, _) in enumerate(candidate_chunks)
     )
 
     try:
@@ -255,11 +271,11 @@ def rewrite_question(question:str,chunks:list[str])->str:
      except(requests.RequestException, json.JSONDecodeError, KeyError, TypeError):
          return question
 
-def generate_answer(question: str, relevant_chunks: list[tuple[str, float,float]]) -> tuple[str, list[int]]:
+def generate_answer(question: str, relevant_chunks: list[tuple[str, int | None, float,float]]) -> tuple[str, list[int]]:
     """Extract a grounded answer and the source numbers that support it."""
     context = "\n\n".join(
-        f"Passage {number}:\n{chunk}"
-        for number, (chunk, _, _) in enumerate(relevant_chunks, start=1)
+        f"Passage {number}{f' (PDF page {page_number})' if page_number else ''}:\n{chunk}"
+        for number, (chunk, page_number, _, _) in enumerate(relevant_chunks, start=1)
     )
     response = requests.post(
         CHAT_URL,
@@ -323,16 +339,20 @@ uploaded_file = st.file_uploader(
 
 if uploaded_file:
     try:
-        document_text,pdf_page_count=extract_document_text(uploaded_file)
+        document_pages,pdf_page_count=extract_document_pages(uploaded_file)
     except(PdfReadError,ValueError) as error:
         st.error(f"This PDF could not be read: {error}")
         st.stop()
+    document_text="\n\n".join(
+        page_text
+        for page_text, _ in document_pages
+    )    
 
     if not document_text.strip():
         st.error("No readable text was found. For a scanned PDF, we need to add OCR first.")
         st.stop()
-    chunks = split_text(document_text)
-    document_id = hashlib.sha256(f"{INDEX_VERSION}:{document_text}".encode("utf-8")).hexdigest()
+    chunks ,chunk_pages=create_chunks_with_sources(document_pages)
+    document_id = hashlib.sha256(f"{INDEX_VERSION}:{json.dumps(document_pages)}".encode("utf-8")).hexdigest()
 
 
     if st.session_state.get("document_id")!=document_id:
@@ -363,8 +383,9 @@ if uploaded_file:
         st.text(document_text)
 
     with st.expander("Preview chunks"):
-        for number, chunk in enumerate(chunks, start=1):
-            st.markdown(f"**Chunk {number}** — {len(chunk)} characters")
+        for number, (chunk,page_number) in enumerate(zip(chunks,chunk_pages), start=1):
+            page_label=f" - PDF Page {page_number}" if page_number else ""
+            st.markdown(f"**Chunk {number}**{page_label} — {len(chunk)} characters")
             st.code(chunk, language=None)
 
     if st.button("Create local embeddings"):
@@ -376,7 +397,8 @@ if uploaded_file:
 
             st.session_state.embeddings = embeddings
             st.success(f"Created {len(embeddings)} local embeddings.")
-            st.caption(f"Each embedding has {len(embeddings[0]):,} numeric dimensions.")
+            if embeddings:
+                st.caption(f"Each embedding has {len(embeddings[0]):,} numeric dimensions.")
         except(requests.RequestException,OSError) as error:
             st.error(f"Ollama could not create embeddings: {error}")
 
@@ -392,6 +414,7 @@ if uploaded_file:
                 candidate_chunks = find_relevant_chunks(
                     search_query,
                     chunks,
+                    chunk_pages,
                     st.session_state.embeddings,
                 )
                 st.session_state.relevant_chunks=rerank_chunks(question.strip(),candidate_chunks)
@@ -404,9 +427,10 @@ if uploaded_file:
         relevant_chunks = st.session_state.relevant_chunks
         st.caption(f"LLM search interpretation: {st.session_state.search_query}")
         st.write("These passages were retrieved from your document:")
-        for number, (chunk, semantic_score, keyword_score) in enumerate(relevant_chunks, start=1):
+        for number, (chunk, page_number, semantic_score, keyword_score) in enumerate(relevant_chunks, start=1):
+            page_label = f" — PDF page {page_number}" if page_number else ""
             st.markdown(
-                f"**Source {number}** — semantic: {semantic_score:.3f}, "
+                f"**Source {number}**{page_label} — semantic: {semantic_score:.3f}, "
                 f"keyword match: {keyword_score:.0%}"
                     )
             st.code(chunk, language=None)
@@ -418,7 +442,15 @@ if uploaded_file:
                 st.subheader("Answer")
                 st.write(answer)
                 if answer_sources:
-                    citations = ", ".join(f"Source {number}" for number in answer_sources)
+                    citations = ", ".join(
+                        (
+                            f"Source {number} (PDF page {relevant_chunks[number-1][1]})"
+                            if relevant_chunks[number-1][1]
+                            else f"Source{number}"
+
+                        )
+                        for number in answer_sources
+                    )
                     st.caption(f"Answer evidence: {citations}")
             except requests.RequestException as error:
                 st.error(f"Ollama could not generate an answer: {error}")
