@@ -18,6 +18,7 @@ CHAT_URL = "http://localhost:11434/api/chat"
 CHAT_MODEL = "llama3.2"
 INDEX_VERSION = "sentence-chunks-hybrid-rerank-query-planner-evidence-pages-v1"
 INDEX_DIRECTORY = Path(".rag_indexes")
+MAX_HISTORY_TURNS=3
 
 def extract_document_pages(uploaded_file)->tuple[list[tuple[str,int | None]],int | None]:
     """Return extracted text paired with its PDF page number, when available."""
@@ -209,9 +210,9 @@ def rerank_chunks(
             timeout=120,
         )
         response.raise_for_status()
-        ranked_index=json.loads(response.json()["message"]["content"])["ranked_indexes"]
+        ranked_indexes=json.loads(response.json()["message"]["content"])["ranked_indexes"]
         valid_indexes=[]
-        for index in ranked_index:
+        for index in ranked_indexes:
             if isinstance(index,int) and 0<=index<len(candidate_chunks):
                 if index not in valid_indexes:
                     valid_indexes.append(index)
@@ -224,9 +225,12 @@ def rerank_chunks(
     return ranked_chunks[:top_k]      
 
 
-def rewrite_question(question:str,chunks:list[str])->str:
-     """Ask the LLM to turn a vague question into a document-search query."""
-     document_excerpt="\n\n".join(chunks[:12])
+def rewrite_question(question:str,chat_history:list[dict[str,str]])->tuple[str,str]:
+     """Use the LLM to make both a generic search query and a standalone question."""
+     history_text="\n\n".join(
+         f"Previous question: {turn['question']}\nPrevious answer:{turn['answer']}"
+         for turn in chat_history[-MAX_HISTORY_TURNS:]
+     ) or "No earlier conversation."
      try:
          response=requests.post(
              CHAT_URL,
@@ -236,21 +240,23 @@ def rewrite_question(question:str,chunks:list[str])->str:
                     {
                         "role": "system",
                         "content": (
-                            "You are a search-query planner, not a question-answering assistant. "
-                            "Return an ABSTRACT search intent, never an answer or a fact extracted "
-                            "from the document. Do not return names, numbers, dates, job titles, or "
-                            "other specific document values. Use generic concepts only. "
-                            "Examples: for 'What is my name?' return 'person full name identity'; "
-                            "for 'What are my skills?' return 'professional technical skills'; "
-                            "for 'What are they talking about?' return 'document main subject overview'. "
-                            "Return only valid JSON: {\"search_query\": \"...\"}."
+                        "You are a search-query planner, not a question-answering assistant. "
+                        "Use the current question and conversation history only to resolve vague "
+                        "references such as 'that', 'they', or 'it'. Never answer the question. "
+                        "Never return names, numbers, dates, job titles, or any specific fact from "
+                        "a previous answer. Return only valid JSON with two strings: "
+                        "{\"search_query\": \"generic concepts only\", "
+                        "\"resolved_question\": \"a complete question without pronouns\"}. "
+                        "For example, 'What are my skills?' becomes search_query 'professional "
+                        "technical skills' and resolved_question 'What professional skills are "
+                        "described in the document?'."
                         ),
                     },
                     {
                         "role": "user",
                         "content": (
-                            f"Document:\n{document_excerpt}\n\n"
-                            f"User question: {question}"
+                            f"Conversation history:\n{history_text}\n\n"
+                            f"current question:\n{question}"
                         ),
                     },
                 ],
@@ -261,15 +267,18 @@ def rewrite_question(question:str,chunks:list[str])->str:
          timeout=120,
          )      
          response.raise_for_status()
-         search_query=json.loads(
+         result=json.loads(
              response.json()["message"]["content"]
-         )["search_query"]
-         if not isinstance(search_query,str):
-             return question
+         )
+         search_query=result["search_query"]
+         resolved_question=result["resolved_question"]
+         if not isinstance(search_query,str) or not isinstance(resolved_question,str):
+             return question,question
          search_query=search_query.strip()
-         return search_query or question
+         resolved_question=resolved_question.strip()
+         return search_query or question, resolved_question or question
      except(requests.RequestException, json.JSONDecodeError, KeyError, TypeError):
-         return question
+         return question,question
 
 def generate_answer(question: str, relevant_chunks: list[tuple[str, int | None, float,float]]) -> tuple[str, list[int]]:
     """Extract a grounded answer and the source numbers that support it."""
@@ -343,7 +352,7 @@ if uploaded_file:
     except(PdfReadError,ValueError) as error:
         st.error(f"This PDF could not be read: {error}")
         st.stop()
-    document_text="\n\n".join(
+    document_text="\n".join(
         page_text
         for page_text, _ in document_pages
     )    
@@ -359,8 +368,10 @@ if uploaded_file:
         st.session_state.document_id=document_id
         st.session_state.pop("embeddings",None)
         st.session_state.pop("relevant_chunks",None)
-        st.session_state.pop("retrieval_question",None)
+        st.session_state.pop("asked_question", None)
+        st.session_state.pop("resolved_question", None)
         st.session_state.pop("search_query", None)
+        st.session_state.pop("chat_history", None)
 
         saved_embeddings=load_saved_embeddings(document_id,len(chunks))
         if saved_embeddings:
@@ -403,6 +414,12 @@ if uploaded_file:
             st.error(f"Ollama could not create embeddings: {error}")
 
     st.subheader("Retrieve relevant chunks")
+    chat_history=st.session_state.get("chat_history",[])
+    if chat_history:
+        with st.expander(f"Conversation memory ({len(chat_history)} recent turns)"):
+            for turn_number,turn in enumerate(chat_history,start=1):
+                st.markdown(f"**You {turn_number}:** {turn['question']}")
+                st.markdown(f"**RAG app:** {turn['answer']}")
     question = st.text_input("Ask a question about this document")
     
     if "embeddings" not in st.session_state:
@@ -410,22 +427,25 @@ if uploaded_file:
     elif st.button("Find relevant chunks", disabled=not question.strip()):
         try:
             with st.spinner("Understanding the question and searching document chunks..."):
-                search_query=rewrite_question(question.strip(),chunks)
+                search_query,resolved_question=rewrite_question(question.strip(),chat_history)
                 candidate_chunks = find_relevant_chunks(
                     search_query,
                     chunks,
                     chunk_pages,
                     st.session_state.embeddings,
                 )
-                st.session_state.relevant_chunks=rerank_chunks(question.strip(),candidate_chunks)
-                st.session_state.retrieval_question = question.strip()
+                st.session_state.relevant_chunks=rerank_chunks(resolved_question,candidate_chunks)
+                st.session_state.asked_question = question.strip()
+                st.session_state.resolved_question = resolved_question
                 st.session_state.search_query=search_query
         except requests.RequestException as error:
             st.error(f"Ollama could not search the document: {error}")
 
-    if st.session_state.get("retrieval_question") == question.strip():
+    if st.session_state.get("asked_question") == question.strip():
         relevant_chunks = st.session_state.relevant_chunks
-        st.caption(f"LLM search interpretation: {st.session_state.search_query}")
+        st.caption(f"LLM search concepts: {st.session_state.search_query}")
+        if st.session_state.resolved_question!=question.strip():
+            st.caption(f"Follow-up interpreted as: {st.session_state.resolved_question}")
         st.write("These passages were retrieved from your document:")
         for number, (chunk, page_number, semantic_score, keyword_score) in enumerate(relevant_chunks, start=1):
             page_label = f" — PDF page {page_number}" if page_number else ""
@@ -437,7 +457,12 @@ if uploaded_file:
         if st.button("Generate grounded answer"):
             try:
                 with st.spinner("Generating an answer from retrieved passages..."):
-                    answer, answer_sources = generate_answer(question.strip(), relevant_chunks)
+                    answer, answer_sources = generate_answer(st.session_state.resolved_question, relevant_chunks)
+                    updated_history=chat_history+[
+                        {"question":question.strip(), "answer":answer}
+                    ]
+                    st.session_state.chat_history=updated_history[-MAX_HISTORY_TURNS:]
+
 
                 st.subheader("Answer")
                 st.write(answer)
