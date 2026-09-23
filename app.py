@@ -19,6 +19,7 @@ CHAT_MODEL = "llama3.2"
 INDEX_VERSION = "sentence-chunks-hybrid-rerank-query-planner-evidence-multi-document-v1"
 INDEX_DIRECTORY = Path(".rag_indexes")
 MAX_HISTORY_TURNS=3
+MMR_RELEVANCE_WEIGHT = 0.75
 
 def extract_file_pages(uploaded_file)->tuple[list[tuple[str,str,int | None]],int | None]:
     """Return text paired with its filename and PDF page number, when available."""
@@ -112,7 +113,7 @@ def create_embeddings(chunks: list[str]) -> list[list[float]]:
     return response.json()["embeddings"]
 
 
-def load_saved_embeddings(document_id: str,chunks_count: int)->list[list[float]] | None:
+def load_saved_embeddings(document_id: str,chunk_count: int)->list[list[float]] | None:
     """Load valid local embeddings for this exact document, if available."""
     index_file=INDEX_DIRECTORY/f"{document_id}.json"
     try:
@@ -120,7 +121,7 @@ def load_saved_embeddings(document_id: str,chunks_count: int)->list[list[float]]
         embeddings=saved_index["embeddings"]
         if saved_index["index_version"]!=INDEX_VERSION:
             return None
-        if not isinstance(embeddings,list) or len(embeddings)!=chunks_count:
+        if not isinstance(embeddings,list) or len(embeddings)!=chunk_count:
             return None
         return embeddings
     except (OSError, json.JSONDecodeError, KeyError, TypeError):
@@ -172,8 +173,33 @@ def find_relevant_chunks(
     scored_chunks = [(chunk, file_name,page_number,cosine_similarity(question_embedding, embedding),keyword_overlap(question, chunk),)
         for chunk, file_name,page_number,embedding in zip(chunks, chunk_files,chunk_pages,document_embeddings)
     ]
-    return sorted(scored_chunks, key=lambda item: (0.85 * item[3]) + (0.15 * item[4]), reverse=True)[:top_k]
+    hybrid_scores=[
+        (0.85*semantic_score)+(0.25*keyword_score)
+        for _,_,_,semantic_score,keyword_score in scored_chunks
+    ]
+    remaining_Indexes=set(range(len(scored_chunks)))
+    selected_Indexes=[]
 
+    while remaining_Indexes and len(selected_Indexes)<top_k:
+        def mmr_score(candidate_Index:int)->float:
+            redundancy=max(
+                (
+                    cosine_similarity(
+                        document_embeddings[candidate_Index],
+                        document_embeddings[selected_Index],
+                    )
+                    for selected_Index in selected_Indexes
+                ),default=0.0,
+            )
+            return (
+                MMR_RELEVANCE_WEIGHT*hybrid_scores[candidate_Index]
+                - (1 - MMR_RELEVANCE_WEIGHT) * redundancy
+            )
+        best_index=max(remaining_Indexes,key=mmr_score)
+        selected_Indexes.append(best_index)
+        remaining_Indexes.remove(best_index)
+
+    return [scored_chunks[index] for index in selected_Indexes]
 
 def rerank_chunks(
         question:str,
