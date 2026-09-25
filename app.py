@@ -167,14 +167,14 @@ def find_relevant_chunks(
     document_embeddings: list[list[float]],
     top_k: int = 5,
 ) -> list[tuple[str, str, int | None, float, float]]:
-    """Rank chunks with mostly semantic similarity plus a small keyword boost."""
+    """Select relevant chunks while avoiding near-duplicate retrieval results."""
     question_embedding = create_embeddings([question])[0]
 
     scored_chunks = [(chunk, file_name,page_number,cosine_similarity(question_embedding, embedding),keyword_overlap(question, chunk),)
         for chunk, file_name,page_number,embedding in zip(chunks, chunk_files,chunk_pages,document_embeddings)
     ]
     hybrid_scores=[
-        (0.85*semantic_score)+(0.25*keyword_score)
+        (0.85*semantic_score)+(0.15*keyword_score)
         for _,_,_,semantic_score,keyword_score in scored_chunks
     ]
     remaining_Indexes=set(range(len(scored_chunks)))
@@ -309,7 +309,7 @@ def rewrite_question(question:str,chat_history:list[dict[str,str]])->tuple[str,s
      except(requests.RequestException, json.JSONDecodeError, KeyError, TypeError):
          return question,question
 
-def generate_answer(question: str, relevant_chunks: list[tuple[str, str, int | None, float,float]]) -> tuple[str, list[int]]:
+def generate_answer(question: str, relevant_chunks: list[tuple[str, str, int | None, float,float]]) -> tuple[str, list[int],bool]:
     """Extract a grounded answer and the source numbers that support it."""
     context = "\n\n".join(
         f"Passage {number} from {file_name}"
@@ -327,10 +327,13 @@ def generate_answer(question: str, relevant_chunks: list[tuple[str, str, int | N
                         "You answer questions using only numbered document passages. "
                         "First inspect every passage for evidence, then answer directly from that evidence. "
                         "If a passage contains the requested fact, you must use it; do not claim it is missing. "
-                        "Only use the missing-answer message when no passage supports any answer. "
+                        "Set supported to true only when one or more passages directly support "
+                        "the answer. Set supported to false when the evidence is missing, vague, "
+                        "or insufficient; in that case, explain what is missing and use an empty "
+                        "source_numbers list. "
                         "Return only JSON in this exact structure: "
-                        '{"answer": "...", "source_numbers": [1, 2]}. '
-                        "source_numbers must contain the passage numbers supporting the answer."
+                        '{"answer": "...", "source_numbers": [1, 2], "supported": true}. '
+                        "source_numbers must contain every passage number supporting the answer."
                     ),
                 },
                 {
@@ -349,7 +352,8 @@ def generate_answer(question: str, relevant_chunks: list[tuple[str, str, int | N
         result = json.loads(response.json()["message"]["content"])
         answer = result["answer"].strip()
         source_numbers = result.get("source_numbers", [])
-        if not isinstance(answer, str) or not isinstance(source_numbers, list):
+        supported=result.get("supported")
+        if not isinstance(answer, str) or not isinstance(source_numbers, list) or not isinstance(supported,bool):
             raise TypeError
 
         valid_sources = sorted(
@@ -359,9 +363,16 @@ def generate_answer(question: str, relevant_chunks: list[tuple[str, str, int | N
                 if isinstance(number, int) and 1 <= number <= len(relevant_chunks)
             }
         )
-        return answer, valid_sources
+        if not supported or not valid_sources:
+            return(
+                "I could not verify an answer from the retrieved passages. "
+                "Try a more specific question or review the sources below.",
+                [],
+                False,
+            )
+        return answer, valid_sources,True
     except (json.JSONDecodeError, KeyError, TypeError, AttributeError):
-        return "I could not produce a grounded answer from the retrieved passages.", []
+        return "I could not produce a grounded answer from the retrieved passages.", [],False
 
 
 
@@ -435,6 +446,7 @@ if uploaded_files:
 
     st.caption(f"Created {len(chunks)} searchable chunks")
     st.caption("Embeddings run locally with Ollama — no API key required.")
+    st.caption("Retrieval balances relevance with passage diversity before LLM reranking.")
     if st.session_state.get("loaded_saved_index"):
         st.info("Loaded saved local embeddings for this document.")
     with st.expander("Preview document text"):
@@ -505,7 +517,7 @@ if uploaded_files:
         if st.button("Generate grounded answer"):
             try:
                 with st.spinner("Generating an answer from retrieved passages..."):
-                    answer, answer_sources = generate_answer(st.session_state.resolved_question, relevant_chunks)
+                    answer, answer_sources,is_supported = generate_answer(st.session_state.resolved_question, relevant_chunks)
                     updated_history=chat_history+[
                         {"question":question.strip(), "answer":answer}
                     ]
@@ -514,6 +526,10 @@ if uploaded_files:
 
                 st.subheader("Answer")
                 st.write(answer)
+                if is_supported:
+                    st.success("Evidence check: supported by the cited passages.")
+                else:
+                    st.warning("Evidence check: the retrieved passages do not support a reliable answer.")       
                 if answer_sources:
                     citations = ", ".join(
                         (
