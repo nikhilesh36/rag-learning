@@ -10,7 +10,7 @@ import requests
 import streamlit as st
 from pypdf import PdfReader
 from pypdf.errors import PdfReadError
-
+from docx import Document
 
 OLLAMA_URL = "http://localhost:11434/api/embed"
 EMBEDDING_MODEL = "embeddinggemma"
@@ -30,6 +30,18 @@ def extract_file_pages(uploaded_file)->tuple[list[tuple[str,str,int | None]],int
             for number, page in enumerate(pdf_reader.pages,start=1)
         ]
         return pages,len(pages)
+    if uploaded_file.name.lower().endswith(".docx"):
+        word_document=Document(BytesIO(uploaded_file.getvalue()))
+        paragraphs=[paragraph.text.strip() for paragraph in word_document.paragraphs]
+        table_rows=[
+            "|".join(cell.text.strip() for cell in row.cells)
+            for table in word_document.tables
+            for row in table.rows
+        ]
+        document_text="\n".join(text for text in paragraphs+table_rows if text)
+        return [(document_text,uploaded_file.name,None)],None
+
+
     document_text=uploaded_file.getvalue().decode("utf-8",errors="replace")
     return [(document_text,uploaded_file.name,None)],None
 
@@ -383,8 +395,8 @@ st.title("📚 My RAG Learning App")
 st.write("We will build this application step by step.")
 
 uploaded_files = st.file_uploader(
-    "Upload a text document or PDFs",
-    type=["txt","pdf"],
+    "Upload a text document or PDFs or Word files",
+    type=["txt","pdf","docx"],
     accept_multiple_files=True,
 )
 
@@ -545,4 +557,4 @@ if uploaded_files:
             except requests.RequestException as error:
                 st.error(f"Ollama could not generate an answer: {error}")
 else:
-    st.info("Upload one or more .txt files or text-based PDFs to begin.")
+    st.info("Upload one or more .txt, .pdf, or .docx files to begin.")
