@@ -4,6 +4,11 @@ import hashlib
 import json
 from pathlib import Path
 from io import BytesIO
+from csv import DictReader
+from io import StringIO
+from zipfile import BadZipFile
+from openpyxl import load_workbook
+
 
 
 import requests
@@ -16,17 +21,17 @@ OLLAMA_URL = "http://localhost:11434/api/embed"
 EMBEDDING_MODEL = "embeddinggemma"
 CHAT_URL = "http://localhost:11434/api/chat"
 CHAT_MODEL = "llama3.2"
-INDEX_VERSION = "sentence-chunks-hybrid-rerank-query-planner-evidence-multi-document-v1"
+INDEX_VERSION = "sentence-chunks-hybrid-rerank-query-planner-evidence-multi-document-spreadsheets-v1"
 INDEX_DIRECTORY = Path(".rag_indexes")
 MAX_HISTORY_TURNS=3
 MMR_RELEVANCE_WEIGHT = 0.75
 
-def extract_file_pages(uploaded_file)->tuple[list[tuple[str,str,int | None]],int | None]:
+def extract_file_pages(uploaded_file)->tuple[list[tuple[str,str,int | None,str | None]],int | None]:
     """Return text paired with its filename and PDF page number, when available."""
     if uploaded_file.name.lower().endswith(".pdf"):
         pdf_reader=PdfReader(BytesIO(uploaded_file.getvalue()))
         pages=[
-            (page.extract_text() or "",uploaded_file.name,number)
+            (page.extract_text() or "",uploaded_file.name,number,None)
             for number, page in enumerate(pdf_reader.pages,start=1)
         ]
         return pages,len(pages)
@@ -34,30 +39,103 @@ def extract_file_pages(uploaded_file)->tuple[list[tuple[str,str,int | None]],int
         word_document=Document(BytesIO(uploaded_file.getvalue()))
         paragraphs=[paragraph.text.strip() for paragraph in word_document.paragraphs]
         table_rows=[
-            "|".join(cell.text.strip() for cell in row.cells)
+            " | ".join(cell.text.strip() for cell in row.cells)
             for table in word_document.tables
             for row in table.rows
         ]
         document_text="\n".join(text for text in paragraphs+table_rows if text)
-        return [(document_text,uploaded_file.name,None)],None
-
+        return [(document_text,uploaded_file.name,None,None)],None
+    if uploaded_file.name.lower().endswith(".csv"):
+        csv_text=uploaded_file.getvalue().decode(
+            "utf-8-sig",
+            errors="replace"
+        )
+        rows=[]
+        for row_number,row in enumerate(
+            DictReader(StringIO(csv_text)),
+            start=2
+        ):
+            row_text=";".join(
+                f"{column}: {value}"
+                for column,value in row.items()
+                if value
+            )
+            if row_text:
+                rows.append(
+                    (
+                        row_text,
+                        uploaded_file.name,
+                        None,
+                        f"row {row_number}"
+                    )
+                )
+        return rows,None
+    if uploaded_file.name.lower().endswith(".xlsx"):
+        workbook=load_workbook(
+            BytesIO(uploaded_file.getvalue()),
+            read_only=True,
+            data_only=True
+        )
+        rows=[]
+        for sheet in workbook.worksheets:
+            sheet_rows=sheet.iter_rows(values_only=True)
+            headers=next(sheet_rows,None)
+            if not headers:
+                continue
+            for row_number,values in enumerate(sheet_rows,start=2):
+                row_text="; ".join(
+                    f"{headers} : {values}"
+                    for headers,values in zip(headers,values)
+                    if headers is not None
+                    and values is not None
+                    and str(values).strip()
+                )
+                if row_text:
+                    rows.append(
+                        (
+                            row_text,
+                            uploaded_file.name,
+                            None,
+                            f"sheet {sheet.title}, row {row_number}"
+                        )
+                    )
+        return rows,None    
 
     document_text=uploaded_file.getvalue().decode("utf-8",errors="replace")
     return [(document_text,uploaded_file.name,None)],None
 
 def create_chunks_with_sources(
-        document_pages:list[tuple[str,str,int | None]],
-)->tuple[list[str],list[str],list[int | None]]:
+        document_pages:list[tuple[str,str,int | None,str | None]],
+)->tuple[list[str],list[str],list[int | None],list[str | None]]:
     """Chunk each page separately so each chunk retains its source file and page."""
     chunks=[]
     chunk_files=[]
     chunk_pages=[]
-    for page_text,file_name,page_number in document_pages:
+    chunk_locations=[]
+    for page_text,file_name,page_number,source_location in document_pages:
         page_chunks=split_text(page_text)
         chunks.extend(page_chunks)
         chunk_files.extend([file_name]*len(page_chunks))
         chunk_pages.extend([page_number]*len(page_chunks))
-    return chunks,chunk_files,chunk_pages    
+        chunk_locations.extend([source_location]*len(page_chunks))
+    return chunks,chunk_files,chunk_pages,chunk_locations
+
+
+def format_source(
+        file_name:str,
+        page_number:int | None,
+        source_location: str | None
+)->str:
+     """Create one readable source label for files, PDF pages, and spreadsheet rows."""
+     details=[]
+     if page_number is not None:
+         details.append(f"PDF page {page_number}")
+     if source_location:
+         details.append(source_location)
+     if details:
+         return f"{file_name} ({', '.join(details)})"  
+     return file_name       
+
 
 
 def split_text(text: str, chunk_size: int = 800, overlap: int = 150) -> list[str]:
@@ -176,18 +254,19 @@ def find_relevant_chunks(
     chunks: list[str],
     chunk_files:list[str],
     chunk_pages:list[int | None],
+    chunk_locations:list[str | None],
     document_embeddings: list[list[float]],
     top_k: int = 5,
-) -> list[tuple[str, str, int | None, float, float]]:
+) -> list[tuple[str, str, int | None, str | None, float, float]]:
     """Select relevant chunks while avoiding near-duplicate retrieval results."""
     question_embedding = create_embeddings([question])[0]
 
-    scored_chunks = [(chunk, file_name,page_number,cosine_similarity(question_embedding, embedding),keyword_overlap(question, chunk),)
-        for chunk, file_name,page_number,embedding in zip(chunks, chunk_files,chunk_pages,document_embeddings)
+    scored_chunks = [(chunk, file_name,page_number,source_location,cosine_similarity(question_embedding, embedding),keyword_overlap(question, chunk),)
+        for chunk, file_name,page_number,source_location,embedding in zip(chunks, chunk_files,chunk_pages,chunk_locations,document_embeddings)
     ]
     hybrid_scores=[
         (0.85*semantic_score)+(0.15*keyword_score)
-        for _,_,_,semantic_score,keyword_score in scored_chunks
+        for _,_,_,_,semantic_score,keyword_score in scored_chunks
     ]
     remaining_Indexes=set(range(len(scored_chunks)))
     selected_Indexes=[]
@@ -215,14 +294,14 @@ def find_relevant_chunks(
 
 def rerank_chunks(
         question:str,
-        candidate_chunks:list[tuple[str,str,int | None,float,float]],
+        candidate_chunks:list[tuple[str,str,int | None,str | None,float,float]],
         top_k:int=3,
-) -> list[tuple[str,str,int | None,float,float]]:
+) -> list[tuple[str,str,int | None,str | None,float,float]]:
     """Use the local chat model to order candidates by direct relevance."""
     passages = "\n\n".join(
-        f"Index {index} from {file_name}"
-        f"{f' (PDF page {page_number})' if page_number else ''}:\n{chunk}"
-        for index, (chunk,file_name,page_number, _, _) in enumerate(candidate_chunks)
+        f"Index {index} from "
+        f"{format_source(file_name,page_number,source_location)}:\n{chunk}"
+        for index, (chunk,file_name,page_number,source_location, _, _) in enumerate(candidate_chunks)
     )
     try:
         response = requests.post(
@@ -282,15 +361,21 @@ def rewrite_question(question:str,chat_history:list[dict[str,str]])->tuple[str,s
                         "role": "system",
                         "content": (
                         "You are a search-query planner, not a question-answering assistant. "
-                        "Use the current question and conversation history only to resolve vague "
+                        "Use the current question and conversation history to resolve vague "
                         "references such as 'that', 'they', or 'it'. Never answer the question. "
-                        "Never return names, numbers, dates, job titles, or any specific fact from "
-                        "a previous answer. Return only valid JSON with two strings: "
-                        "{\"search_query\": \"generic concepts only\", "
-                        "\"resolved_question\": \"a complete question without pronouns\"}. "
-                        "For example, 'What are my skills?' becomes search_query 'professional "
-                        "technical skills' and resolved_question 'What professional skills are "
-                        "described in the document?'."
+
+                        "IMPORTANT SEARCH RULES: "
+                        "Preserve every explicitly mentioned person name, company name, "
+                        "identifier, date, location, and other specific entity in the current "
+                        "question. Never remove or generalize these entities from the search query. "
+                        "Include the important keywords needed to retrieve the exact information. "
+
+                        "For follow-up questions, resolve pronouns using conversation history "
+                        "and preserve the actual entity being discussed. "
+
+                        "Return only valid JSON with two strings: "
+                        "{\"search_query\": \"specific search terms\", "
+                        "\"resolved_question\": \"a complete standalone question\"}. "
                         ),
                     },
                     {
@@ -321,12 +406,12 @@ def rewrite_question(question:str,chat_history:list[dict[str,str]])->tuple[str,s
      except(requests.RequestException, json.JSONDecodeError, KeyError, TypeError):
          return question,question
 
-def generate_answer(question: str, relevant_chunks: list[tuple[str, str, int | None, float,float]]) -> tuple[str, list[int],bool]:
+def generate_answer(question: str, relevant_chunks: list[tuple[str, str, int | None,str | None, float,float]]) -> tuple[str, list[int],bool]:
     """Extract a grounded answer and the source numbers that support it."""
     context = "\n\n".join(
-        f"Passage {number} from {file_name}"
-        f"{f' (PDF page {page_number})' if page_number else ''}:\n{chunk}"
-        for number, (chunk, file_name,page_number, _, _) in enumerate(relevant_chunks, start=1)
+        f"Passage {number} from "
+    f"{format_source(file_name, page_number,source_location)}:\n{chunk}"
+        for number, (chunk, file_name,page_number,source_location ,_, _) in enumerate(relevant_chunks, start=1)
     )
     response = requests.post(
         CHAT_URL,
@@ -396,7 +481,7 @@ st.write("We will build this application step by step.")
 
 uploaded_files = st.file_uploader(
     "Upload a text document or PDFs or Word files",
-    type=["txt","pdf","docx"],
+    type=["txt","pdf","docx","csv","xlsx"],
     accept_multiple_files=True,
 )
 
@@ -408,10 +493,10 @@ if uploaded_files:
     for uploaded_file in uploaded_files:
         try:
             file_pages,pdf_page_count=extract_file_pages(uploaded_file)
-        except (PdfReadError, ValueError) as error:
+        except (PdfReadError,BadZipFile, ValueError) as error:
             unreadable_files.append(f"{uploaded_file.name}: {error}")
             continue    
-        if not any(page_text.strip() for page_text,_,_ in file_pages):
+        if not any(page_text.strip() for page_text,_,_,_ in file_pages):
             empty_files.append(uploaded_file.name)
             continue
         document_pages.extend(file_pages)
@@ -426,11 +511,15 @@ if uploaded_files:
         st.error("No readable text was found. For a scanned PDF, we need to add OCR first.")
         st.stop()
     document_text = "\n\n".join(
-        f"--- {file_name} ---\n{page_text}"
-        for page_text, file_name, _ in document_pages
+        f"--- {format_source(file_name, page_number, source_location)} ---\n{page_text}"
+        for page_text, file_name, page_number,source_location in document_pages
     )   
-    chunks,chunk_files,chunk_pages=create_chunks_with_sources(document_pages)
-    loaded_file_names = list(dict.fromkeys(chunk_files))
+    chunks,chunk_files,chunk_pages,chunk_locations=create_chunks_with_sources(document_pages)
+    loaded_file_names = list(dict.fromkeys(
+        file_name
+        for _,file_name,_,_ in document_pages
+    ))
+
     document_id = hashlib.sha256(f"{INDEX_VERSION}:{json.dumps(document_pages)}".encode("utf-8")).hexdigest()
 
 
@@ -465,23 +554,31 @@ if uploaded_files:
         st.text(document_text)
 
     with st.expander("Preview chunks"):
-        for number, (chunk,file_name,page_number) in enumerate(zip(chunks,chunk_files,chunk_pages), start=1):
-            page_label=f" - PDF Page {page_number}" if page_number else ""
-            st.markdown(f"**Chunk {number}** — {file_name}{page_label} — {len(chunk)} characters")
+        for number, (chunk,file_name,page_number,source_location) in enumerate(zip(chunks,chunk_files,chunk_pages,chunk_locations), start=1):
+            st.markdown(
+                f"**Chunk {number}** — "
+                f"{format_source(file_name, page_number, source_location)} — "
+                f"{len(chunk)} characters"
+                )
             st.code(chunk, language=None)
+
+
 
     if st.button("Create local embeddings"):
         try:
             with st.spinner("Creating vectors locally with Ollama..."):
                 embeddings = create_embeddings(chunks)
                 save_embeddings(document_id,embeddings)
-                st.session_state.loaded_saved_index = False
 
             st.session_state.embeddings = embeddings
+            st.session_state.loaded_saved_index = False
+
             st.success(f"Created {len(embeddings)} local embeddings.")
             st.caption(f"Each embedding has {len(embeddings[0]):,} numeric dimensions.")
         except(requests.RequestException,OSError) as error:
             st.error(f"Ollama could not create embeddings: {error}")
+
+
 
     st.subheader("Retrieve relevant chunks")
     chat_history=st.session_state.get("chat_history",[])
@@ -491,6 +588,9 @@ if uploaded_files:
                 st.markdown(f"**You {turn_number}:** {turn['question']}")
                 st.markdown(f"**RAG app:** {turn['answer']}")
     question = st.text_input("Ask a question about this document")
+
+
+
     
     if "embeddings" not in st.session_state:
         st.info("First, click 'Create local embeddings' for this document.")
@@ -503,6 +603,7 @@ if uploaded_files:
                     chunks,
                     chunk_files,
                     chunk_pages,
+                    chunk_locations,
                     st.session_state.embeddings,
                 )
                 st.session_state.relevant_chunks=rerank_chunks(resolved_question,candidate_chunks)
@@ -518,14 +619,16 @@ if uploaded_files:
         if st.session_state.resolved_question!=question.strip():
             st.caption(f"Follow-up interpreted as: {st.session_state.resolved_question}")
         st.write("These passages were retrieved from your document:")
-        for number, (chunk, file_name,page_number, semantic_score, keyword_score) in enumerate(relevant_chunks, start=1):
-            page_label = f" — PDF page {page_number}" if page_number else ""
+        for number, (chunk, file_name,page_number, source_location,semantic_score, keyword_score) in enumerate(relevant_chunks, start=1):
             st.markdown(
-                f"**Source {number}** — {file_name}{page_label} — "
+                f"**Source {number}** — "
+                f"{format_source(file_name, page_number, source_location)} — "
                 f"semantic: {semantic_score:.3f}, "
                 f"keyword match: {keyword_score:.0%}"
             )
             st.code(chunk, language=None)
+
+            
         if st.button("Generate grounded answer"):
             try:
                 with st.spinner("Generating an answer from retrieved passages..."):
@@ -535,26 +638,21 @@ if uploaded_files:
                     ]
                     st.session_state.chat_history=updated_history[-MAX_HISTORY_TURNS:]
 
-
                 st.subheader("Answer")
                 st.write(answer)
                 if is_supported:
-                    st.success("Evidence check: supported by the cited passages.")
-                else:
-                    st.warning("Evidence check: the retrieved passages do not support a reliable answer.")       
-                if answer_sources:
+                    st.success("Evidence check: supported by the cited passages.") 
                     citations = ", ".join(
                         (
-                            f"Source {number} ({relevant_chunks[number - 1][1]}, "
-                            f"PDF page {relevant_chunks[number - 1][2]})"
-                            if relevant_chunks[number - 1][2]
-                            else f"Source {number} ({relevant_chunks[number - 1][1]})"
-
+                            f"Source {number} ("
+                            f"{format_source(*relevant_chunks[number - 1][1:4])})"
                         )
                         for number in answer_sources
                     )
                     st.caption(f"Answer evidence: {citations}")
+                else:
+                    st.warning("Evidence check: the retrieved passages do not support a reliable answer.")     
             except requests.RequestException as error:
                 st.error(f"Ollama could not generate an answer: {error}")
 else:
-    st.info("Upload one or more .txt, .pdf, or .docx files to begin.")
+    st.info("Upload one or more .txt, .pdf, .docx, .csv, or .xlsx files to begin.")
