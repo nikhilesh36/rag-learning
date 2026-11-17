@@ -55,7 +55,7 @@ def extract_file_pages(uploaded_file)->tuple[list[tuple[str,str,int | None,str |
             DictReader(StringIO(csv_text)),
             start=2
         ):
-            row_text=";".join(
+            row_text="; ".join(
                 f"{column}: {value}"
                 for column,value in row.items()
                 if value
@@ -84,11 +84,11 @@ def extract_file_pages(uploaded_file)->tuple[list[tuple[str,str,int | None,str |
                 continue
             for row_number,values in enumerate(sheet_rows,start=2):
                 row_text="; ".join(
-                    f"{headers} : {values}"
-                    for headers,values in zip(headers,values)
-                    if headers is not None
-                    and values is not None
-                    and str(values).strip()
+                    f"{header} : {value}"
+                    for header,value in zip(headers,values)
+                    if header is not None 
+                    and value is not None
+                    and str(value).strip()
                 )
                 if row_text:
                     rows.append(
@@ -102,7 +102,7 @@ def extract_file_pages(uploaded_file)->tuple[list[tuple[str,str,int | None,str |
         return rows,None    
 
     document_text=uploaded_file.getvalue().decode("utf-8",errors="replace")
-    return [(document_text,uploaded_file.name,None)],None
+    return [(document_text,uploaded_file.name,None,None)],None
 
 def create_chunks_with_sources(
         document_pages:list[tuple[str,str,int | None,str | None]],
@@ -121,6 +121,44 @@ def create_chunks_with_sources(
     return chunks,chunk_files,chunk_pages,chunk_locations
 
 
+def filter_chunks_by_files(
+        chunks: list[str],
+        chunk_files: list[str],
+        chunk_pages:list[int | None],
+        chunk_locations:list[str | None],
+        embeddings: list[list[float]],
+        selected_files:list[str]
+)-> tuple[list[str],list[str],list[int | None],list[str | None],list[list[float]]]:
+    """Keep chunks and their embeddings aligned while filtering by source filename."""
+    metadata_lengths={
+        len(chunks),
+        len(chunk_files),
+        len(chunk_pages),
+        len(chunk_locations),
+        len(embeddings),
+    }
+    if len(metadata_lengths)!=1:
+        raise ValueError("Chunk metadata and embeddings must have matching lengths.")
+    selected_file_set=set(selected_files)
+    filtered_items=[
+        (chunk,file_name,page_number,source_location,embedding)
+        for chunk,file_name,page_number,source_location,embedding in zip(
+            chunks, chunk_files, chunk_pages, chunk_locations, embeddings
+        )
+        if file_name in selected_file_set
+    ]
+    if not filtered_items:
+        return [],[],[],[],[]
+    filtered_chunks, filtered_files, filtered_pages, filtered_locations, filtered_embeddings=zip(*filtered_items)
+    return (
+        list(filtered_chunks),
+        list(filtered_files),
+        list(filtered_pages),
+        list(filtered_locations),
+        list(filtered_embeddings),
+    )
+    
+    
 def format_source(
         file_name:str,
         page_number:int | None,
@@ -530,6 +568,7 @@ if uploaded_files:
         st.session_state.pop("asked_question", None)
         st.session_state.pop("resolved_question", None)
         st.session_state.pop("search_query", None)
+        st.session_state.pop("searched_files", None)
         st.session_state.pop("chat_history", None)
 
         saved_embeddings=load_saved_embeddings(document_id,len(chunks))
@@ -581,6 +620,13 @@ if uploaded_files:
 
 
     st.subheader("Retrieve relevant chunks")
+
+    selected_files=st.multiselect(
+        "Files to Search",
+        options=loaded_file_names,
+        default=loaded_file_names,
+        help="Only selected files can be used as evidence for the answer.",
+    )
     chat_history=st.session_state.get("chat_history",[])
     if chat_history:
         with st.expander(f"Conversation memory ({len(chat_history)} recent turns)"):
@@ -598,13 +644,28 @@ if uploaded_files:
         try:
             with st.spinner("Understanding the question and searching document chunks..."):
                 search_query,resolved_question=rewrite_question(question.strip(),chat_history)
-                candidate_chunks = find_relevant_chunks(
-                    search_query,
+
+                (
+                    search_chunks,
+                    search_files,
+                    search_pages,
+                    search_locations,
+                    search_embeddings,
+                ) = filter_chunks_by_files(
                     chunks,
                     chunk_files,
                     chunk_pages,
                     chunk_locations,
                     st.session_state.embeddings,
+                    selected_files,
+                    )
+                candidate_chunks = find_relevant_chunks(
+                    search_query,
+                    search_chunks,
+                    search_files,
+                    search_pages,
+                    search_locations,
+                    search_embeddings,
                 )
                 st.session_state.relevant_chunks=rerank_chunks(resolved_question,candidate_chunks)
                 st.session_state.asked_question = question.strip()
