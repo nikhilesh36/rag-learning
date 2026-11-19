@@ -56,7 +56,7 @@ def extract_file_pages(uploaded_file)->tuple[list[tuple[str,str,int | None,str |
             start=2
         ):
             row_text="; ".join(
-                f"{column}: {value}"
+                f"{column} : {value}"
                 for column,value in row.items()
                 if value
             )
@@ -288,7 +288,7 @@ def keyword_overlap(question: str, chunk: str)->float:
 
 
 def find_relevant_chunks(
-    question: str,
+    search_queries: list[str],
     chunks: list[str],
     chunk_files:list[str],
     chunk_pages:list[int | None],
@@ -296,11 +296,46 @@ def find_relevant_chunks(
     document_embeddings: list[list[float]],
     top_k: int = 5,
 ) -> list[tuple[str, str, int | None, str | None, float, float]]:
-    """Select relevant chunks while avoiding near-duplicate retrieval results."""
-    question_embedding = create_embeddings([question])[0]
+    """Use exact and rewritten queries while avoiding near-duplicate results."""
 
-    scored_chunks = [(chunk, file_name,page_number,source_location,cosine_similarity(question_embedding, embedding),keyword_overlap(question, chunk),)
-        for chunk, file_name,page_number,source_location,embedding in zip(chunks, chunk_files,chunk_pages,chunk_locations,document_embeddings)
+    clean_queries=list(
+        dict.fromkeys(
+            query.strip()
+            for query in search_queries
+            if query.strip()
+        )
+    )
+    if not clean_queries:
+        raise ValueError("At least one search query is required.")
+    
+    query_embeddings=create_embeddings(clean_queries)
+
+    if len(query_embeddings)!=len(clean_queries):
+        raise ValueError("Ollama returned an unexpected number of query embeddings.")
+
+    scored_chunks=[
+        (
+            chunk,
+            file_name,
+            page_number,
+            source_location,
+            max(
+                cosine_similarity(query_embedding,embedding)
+                for query_embedding in query_embeddings
+            ),
+            max(
+                keyword_overlap(query,chunk)
+                for query in clean_queries
+            ),
+        )
+        for chunk, file_name, page_number, source_location, embedding
+        in zip(
+            chunks,
+            chunk_files,
+            chunk_pages,
+            chunk_locations,
+            document_embeddings
+        )
     ]
     hybrid_scores=[
         (0.85*semantic_score)+(0.15*keyword_score)
@@ -640,6 +675,10 @@ if uploaded_files:
     
     if "embeddings" not in st.session_state:
         st.info("First, click 'Create local embeddings' for this document.")
+
+    elif not selected_files:
+        st.info("Select at least one file to search.")
+
     elif st.button("Find relevant chunks", disabled=not question.strip()):
         try:
             with st.spinner("Understanding the question and searching document chunks..."):
@@ -660,7 +699,7 @@ if uploaded_files:
                     selected_files,
                     )
                 candidate_chunks = find_relevant_chunks(
-                    search_query,
+                    [question.strip(),search_query],
                     search_chunks,
                     search_files,
                     search_pages,
@@ -671,11 +710,18 @@ if uploaded_files:
                 st.session_state.asked_question = question.strip()
                 st.session_state.resolved_question = resolved_question
                 st.session_state.search_query=search_query
+
+                st.session_state.searched_files=sorted(selected_files)
         except requests.RequestException as error:
             st.error(f"Ollama could not search the document: {error}")
+        except ValueError as error:
+            st.error(f"The search index is not aligned: {error}")    
 
-    if st.session_state.get("asked_question") == question.strip():
+    if (
+        st.session_state.get("asked_question") == question.strip() and st.session_state.get("searched_files")==sorted(selected_files)
+        ):
         relevant_chunks = st.session_state.relevant_chunks
+        st.caption("Searching: " + ", ".join(selected_files))
         st.caption(f"LLM search concepts: {st.session_state.search_query}")
         if st.session_state.resolved_question!=question.strip():
             st.caption(f"Follow-up interpreted as: {st.session_state.resolved_question}")
@@ -717,3 +763,4 @@ if uploaded_files:
                 st.error(f"Ollama could not generate an answer: {error}")
 else:
     st.info("Upload one or more .txt, .pdf, .docx, .csv, or .xlsx files to begin.")
+
